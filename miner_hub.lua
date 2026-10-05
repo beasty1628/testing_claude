@@ -1,0 +1,396 @@
+-- Miner Hub: Rayfield UI built on the game's own remotes
+-- Executor LocalScript
+
+local Shared = shared
+
+-- Clean up a previous copy of this script before starting
+if Shared.MinerHubUnload then
+	pcall(Shared.MinerHubUnload)
+	Shared.MinerHubUnload = nil
+end
+
+local okLoad, Rayfield = pcall(function()
+	return loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+end)
+if not okLoad or not Rayfield then
+	warn("[Miner Hub] Failed to load Rayfield: " .. tostring(Rayfield))
+	return
+end
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LocalPlayer = Players.LocalPlayer
+
+local Running = true
+local Connections = {}
+
+local function track(conn)
+	table.insert(Connections, conn)
+	return conn
+end
+
+local function notify(title, text)
+	pcall(function()
+		Rayfield:Notify({Title = title, Content = text, Duration = 4})
+	end)
+end
+
+local function find(path)
+	local node = ReplicatedStorage
+	for i = 1, #path do
+		if not node then
+			return nil
+		end
+		node = node:FindFirstChild(path[i])
+	end
+	return node
+end
+
+-- Remotes taken from the scripts provided
+local MinerInventory = find({"MinerInventory"})
+local OreInventory = find({"OreMining", "Remotes", "OreInventory"})
+local SellRequest = find({"Selling", "Request"})
+local IndexRemotes = find({"RollAMinerIndex", "Remotes"})
+local CrateRemotes = find({"LuckyCrates", "Remotes"})
+
+local function cash(n)
+	local s = tostring(math.floor(tonumber(n) or 0))
+	local out = s:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")
+	return "$" .. out
+end
+
+local function count(t)
+	local n = 0
+	if type(t) == "table" then
+		for _ in pairs(t) do
+			n = n + 1
+		end
+	end
+	return n
+end
+
+-- Inventory state, kept up to date from the game's own sync events
+local Miners = {}
+local MinerCapacity = 0
+local Ores = {}
+local OreCapacity = 0
+
+local Window = Rayfield:CreateWindow({
+	Name = "Miner Hub",
+	LoadingTitle = "Miner Hub",
+	LoadingSubtitle = "Rayfield",
+	Discord = {Enabled = false, Invite = "", RememberJoins = true},
+	KeySystem = false
+})
+
+-- Inventory tab
+local InvTab = Window:CreateTab("Inventory", 4483362458)
+InvTab:CreateSection("Stats")
+local StatsLabel = InvTab:CreateLabel("Miners: ?  |  Ores: ?")
+
+local function refreshStats()
+	pcall(function()
+		StatsLabel:Set("Miners: " .. count(Miners) .. "/" .. MinerCapacity .. "  |  Ores: " .. count(Ores) .. "/" .. OreCapacity)
+	end)
+end
+
+InvTab:CreateSection("Actions")
+InvTab:CreateButton({
+	Name = "Equip Best",
+	Callback = function()
+		pcall(function()
+			MinerInventory.EquipBest:FireServer()
+			notify("Inventory", "Equip Best sent.")
+		end)
+	end
+})
+
+InvTab:CreateButton({
+	Name = "Refresh Inventory",
+	Callback = function()
+		pcall(function()
+			MinerInventory.RequestInventory:FireServer()
+			OreInventory:FireServer("Request")
+		end)
+	end
+})
+
+-- Selling tab
+local IncludeCollector = false
+local AutoSell = false
+local SellInterval = 30
+
+local function quickSell(silent)
+	local ok, err = pcall(function()
+		local qOk, quote = pcall(SellRequest.InvokeServer, SellRequest, "QuoteQuickSell", IncludeCollector)
+		if not qOk or type(quote) ~= "table" or not quote.Ok then
+			local reason = type(quote) == "table" and quote.Reason or "No quote"
+			if not silent then
+				notify("Quick Sell", tostring(reason))
+			end
+			return
+		end
+		if (quote.Count or 0) <= 0 or not quote.QuoteId then
+			if not silent then
+				notify("Quick Sell", "Nothing to sell.")
+			end
+			return
+		end
+		local sOk, result = pcall(SellRequest.InvokeServer, SellRequest, "QuickSell", quote.QuoteId)
+		if sOk and type(result) == "table" and result.Ok then
+			notify("Quick Sell", "Sold " .. tostring(result.Count or 0) .. " ores for " .. cash(result.Cash))
+		elseif not silent then
+			local reason = type(result) == "table" and result.Reason or "Sell failed"
+			notify("Quick Sell", tostring(reason))
+		end
+	end)
+	if not ok then
+		warn("[Miner Hub] Quick Sell: " .. tostring(err))
+	end
+end
+
+local SellTab = Window:CreateTab("Selling", 4483362458)
+SellTab:CreateParagraph({Title = "Quick Sell", Content = "Uses the game's Quick Sell request. The server may require the Quick Sell pass."})
+
+SellTab:CreateButton({
+	Name = "Quick Sell Now",
+	Callback = function()
+		pcall(function()
+			task.spawn(quickSell, false)
+		end)
+	end
+})
+
+SellTab:CreateToggle({
+	Name = "Include Collector",
+	CurrentValue = false,
+	Flag = "IncludeCollector",
+	Callback = function(v)
+		pcall(function()
+			IncludeCollector = v
+		end)
+	end
+})
+
+SellTab:CreateToggle({
+	Name = "Auto Quick Sell",
+	CurrentValue = false,
+	Flag = "AutoSell",
+	Callback = function(v)
+		pcall(function()
+			AutoSell = v
+		end)
+	end
+})
+
+SellTab:CreateSlider({
+	Name = "Auto Sell Interval",
+	Range = {5, 300},
+	Increment = 5,
+	Suffix = "s",
+	CurrentValue = 30,
+	Flag = "SellInterval",
+	Callback = function(v)
+		pcall(function()
+			SellInterval = v
+		end)
+	end
+})
+
+task.spawn(function()
+	local waited = 0
+	while Running do
+		task.wait(1)
+		waited = waited + 1
+		if AutoSell and waited >= SellInterval then
+			waited = 0
+			quickSell(true)
+		elseif not AutoSell then
+			waited = 0
+		end
+	end
+end)
+
+-- Index tab
+local AutoClaim = false
+local Claiming = false
+
+local function claimMilestones(silent)
+	if Claiming then
+		return
+	end
+	Claiming = true
+	local ok, err = pcall(function()
+		local Registry = require(ReplicatedStorage.RollAMinerIndex.IndexRegistry)
+		local Request = IndexRemotes.Request
+		local sOk, snap = pcall(Request.InvokeServer, Request, "Snapshot")
+		if not sOk or type(snap) ~= "table" or not snap.Ok or type(snap.Snapshot) ~= "table" then
+			if not silent then
+				notify("Index", "Could not read index snapshot.")
+			end
+			return
+		end
+		local discovered = snap.Snapshot.Discovered or {}
+		local claimed = snap.Snapshot.Claimed or {}
+		local claimedCount = 0
+		for _, cat in ipairs(Registry.GetCategories()) do
+			for _, variant in ipairs(Registry.GetVariants(cat.Id)) do
+				local set = {}
+				local list = discovered[cat.Id] and discovered[cat.Id][variant.Id] or {}
+				for _, id in ipairs(list) do
+					set[id] = true
+				end
+				local done = {}
+				local clist = claimed[cat.Id] and claimed[cat.Id][variant.Id] or {}
+				for _, m in ipairs(clist) do
+					done[tostring(m)] = true
+				end
+				local have, total = Registry.Completion(cat.Id, variant.Id, set)
+				for _, m in ipairs(Registry.GetMilestones()) do
+					if not done[tostring(m)] and Registry.IsReached(have, total, m) and Registry.IsRewardActive(Registry.GetReward(cat.Id, variant.Id, m)) then
+						local cOk, res = pcall(Request.InvokeServer, Request, "Claim", {Category = cat.Id, Variant = variant.Id, Milestone = m})
+						if cOk and type(res) == "table" and res.Ok then
+							claimedCount = claimedCount + 1
+						end
+					end
+				end
+			end
+		end
+		if claimedCount > 0 or not silent then
+			notify("Index", "Claimed " .. claimedCount .. " milestone reward(s).")
+		end
+	end)
+	Claiming = false
+	if not ok then
+		warn("[Miner Hub] Index claim: " .. tostring(err))
+		if not silent then
+			notify("Index", "Claim failed, see console.")
+		end
+	end
+end
+
+local IndexTab = Window:CreateTab("Index", 4483362458)
+IndexTab:CreateButton({
+	Name = "Claim Reached Milestones",
+	Callback = function()
+		pcall(function()
+			task.spawn(claimMilestones, false)
+		end)
+	end
+})
+
+IndexTab:CreateToggle({
+	Name = "Auto Claim On Discovery",
+	CurrentValue = false,
+	Flag = "AutoClaim",
+	Callback = function(v)
+		pcall(function()
+			AutoClaim = v
+		end)
+	end
+})
+
+-- Crates tab
+local CrateNotify = false
+
+local CrateTab = Window:CreateTab("Crates", 4483362458)
+CrateTab:CreateToggle({
+	Name = "Notify Crate Results",
+	CurrentValue = false,
+	Flag = "CrateNotify",
+	Callback = function(v)
+		pcall(function()
+			CrateNotify = v
+		end)
+	end
+})
+
+-- Settings tab
+local SettingsTab = Window:CreateTab("Settings", 4483362458)
+
+local function unload()
+	Running = false
+	for _, conn in ipairs(Connections) do
+		pcall(function()
+			conn:Disconnect()
+		end)
+	end
+	Connections = {}
+	pcall(function()
+		Rayfield:Destroy()
+	end)
+	if Shared.MinerHubUnload == unload then
+		Shared.MinerHubUnload = nil
+	end
+end
+Shared.MinerHubUnload = unload
+
+SettingsTab:CreateButton({
+	Name = "Unload",
+	Callback = function()
+		pcall(unload)
+	end
+})
+
+-- Event listeners
+if MinerInventory and MinerInventory:FindFirstChild("Sync") then
+	track(MinerInventory.Sync.OnClientEvent:Connect(function(kind, a)
+		pcall(function()
+			if kind == "Snapshot" and type(a) == "table" then
+				Miners = a.Miners or {}
+				MinerCapacity = a.Capacity or MinerCapacity
+			elseif kind == "Added" and type(a) == "table" and a.UniqueId then
+				Miners[a.UniqueId] = a
+			elseif kind == "Removed" then
+				Miners[a] = nil
+			end
+			refreshStats()
+		end)
+	end))
+end
+
+if OreInventory then
+	track(OreInventory.OnClientEvent:Connect(function(kind, a)
+		pcall(function()
+			if kind == "Snapshot" and type(a) == "table" then
+				Ores = a.Items or {}
+				OreCapacity = a.Capacity or OreCapacity
+			elseif kind == "Added" and type(a) == "table" then
+				for _, v in pairs(a) do
+					if type(v) == "table" and v.UniqueId then
+						Ores[v.UniqueId] = v
+					end
+				end
+			elseif kind == "Removed" then
+				Ores[a] = nil
+			end
+			refreshStats()
+		end)
+	end))
+end
+
+if IndexRemotes and IndexRemotes:FindFirstChild("Sync") then
+	track(IndexRemotes.Sync.OnClientEvent:Connect(function(kind)
+		pcall(function()
+			if kind == "Discovered" and AutoClaim then
+				task.delay(1, claimMilestones, true)
+			end
+		end)
+	end))
+end
+
+if CrateRemotes and CrateRemotes:FindFirstChild("Reveal") then
+	track(CrateRemotes.Reveal.OnClientEvent:Connect(function(kind, data)
+		pcall(function()
+			if kind == "Begin" and CrateNotify and type(data) == "table" and type(data.Result) == "table" and not data.Preview then
+				notify("Crate (" .. tostring(data.Tier or "?") .. ")", tostring(data.Result.Name or "?"))
+			end
+		end)
+	end))
+end
+
+-- Ask the server for fresh inventory snapshots so the stats label fills in
+pcall(function()
+	MinerInventory.RequestInventory:FireServer()
+	OreInventory:FireServer("Request")
+end)
