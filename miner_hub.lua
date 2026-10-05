@@ -115,6 +115,119 @@ InvTab:CreateButton({
 	end
 })
 
+-- Ore drops: the server tells us where our private drops are (OreDrops "Created" / "Snapshot")
+local OreDrops = find({"OreMining", "Remotes", "OreDrops"})
+local Drops = {}
+local AutoCollect = false
+local Collecting = false
+local DropDelay = 0.2
+
+local OreTab = Window:CreateTab("Ores", 4483362458)
+local DropLabel = OreTab:CreateLabel("Known drops: 0")
+
+local function refreshDrops()
+	pcall(function()
+		DropLabel:Set("Known drops: " .. count(Drops))
+	end)
+end
+
+local function addDrop(d)
+	if type(d) == "table" and type(d.Id) == "string" and typeof(d.Pos) == "Vector3" then
+		Drops[d.Id] = d.Pos
+	end
+end
+
+local function collectDrops()
+	if Collecting then
+		return
+	end
+	Collecting = true
+	local ok, err = pcall(function()
+		local char = LocalPlayer.Character
+		local root = char and char:FindFirstChild("HumanoidRootPart")
+		if not root then
+			return
+		end
+		local home = root.CFrame
+		local visited = 0
+		for id, pos in pairs(Drops) do
+			if not Running then
+				break
+			end
+			if root.Parent == nil then
+				break
+			end
+			root.CFrame = CFrame.new(pos + Vector3.new(0, 2.5, 0))
+			root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+			visited = visited + 1
+			task.wait(DropDelay)
+		end
+		if root.Parent and visited > 0 then
+			root.CFrame = home
+		end
+	end)
+	Collecting = false
+	if not ok then
+		warn("[Miner Hub] Collect: " .. tostring(err))
+	end
+end
+
+OreTab:CreateButton({
+	Name = "Collect Drops Now",
+	Callback = function()
+		pcall(function()
+			if count(Drops) == 0 then
+				OreDrops:FireServer("Snapshot")
+				notify("Ores", "No drops known yet, asked server for a snapshot.")
+			end
+			task.spawn(collectDrops)
+		end)
+	end
+})
+
+OreTab:CreateToggle({
+	Name = "Auto Collect Drops",
+	CurrentValue = false,
+	Flag = "AutoCollect",
+	Callback = function(v)
+		pcall(function()
+			AutoCollect = v
+		end)
+	end
+})
+
+OreTab:CreateSlider({
+	Name = "Wait Per Drop",
+	Range = {0.05, 1},
+	Increment = 0.05,
+	Suffix = "s",
+	CurrentValue = 0.2,
+	Flag = "DropDelay",
+	Callback = function(v)
+		pcall(function()
+			DropDelay = v
+		end)
+	end
+})
+
+OreTab:CreateButton({
+	Name = "Request Drop Snapshot",
+	Callback = function()
+		pcall(function()
+			OreDrops:FireServer("Snapshot")
+		end)
+	end
+})
+
+task.spawn(function()
+	while Running do
+		task.wait(1)
+		if AutoCollect and not Collecting and count(Drops) > 0 then
+			collectDrops()
+		end
+	end
+end)
+
 -- Selling tab
 local IncludeCollector = false
 local AutoSell = false
@@ -279,6 +392,38 @@ IndexTab:CreateButton({
 	end
 })
 
+IndexTab:CreateButton({
+	Name = "Force Claim Every Milestone",
+	Callback = function()
+		pcall(function()
+			task.spawn(function()
+				local ok, err = pcall(function()
+					local Registry = require(ReplicatedStorage.RollAMinerIndex.IndexRegistry)
+					local Request = IndexRemotes.Request
+					local tried = 0
+					local got = 0
+					for _, cat in ipairs(Registry.GetCategories()) do
+						for _, variant in ipairs(Registry.GetVariants(cat.Id)) do
+							for _, m in ipairs(Registry.GetMilestones()) do
+								tried = tried + 1
+								local cOk, res = pcall(Request.InvokeServer, Request, "Claim", {Category = cat.Id, Variant = variant.Id, Milestone = m})
+								if cOk and type(res) == "table" and res.Ok then
+									got = got + 1
+								end
+							end
+						end
+					end
+					notify("Index", "Tried " .. tried .. ", claimed " .. got .. ".")
+				end)
+				if not ok then
+					warn("[Miner Hub] Force claim: " .. tostring(err))
+					notify("Index", "Force claim failed, see console.")
+				end
+			end)
+		end)
+	end
+})
+
 IndexTab:CreateToggle({
 	Name = "Auto Claim On Discovery",
 	CurrentValue = false,
@@ -301,6 +446,19 @@ CrateTab:CreateToggle({
 	Callback = function(v)
 		pcall(function()
 			CrateNotify = v
+		end)
+	end
+})
+
+local CrateSkip = false
+
+CrateTab:CreateToggle({
+	Name = "Auto Skip Crate Roll",
+	CurrentValue = false,
+	Flag = "CrateSkip",
+	Callback = function(v)
+		pcall(function()
+			CrateSkip = v
 		end)
 	end
 })
@@ -385,6 +543,44 @@ if CrateRemotes and CrateRemotes:FindFirstChild("Reveal") then
 			if kind == "Begin" and CrateNotify and type(data) == "table" and type(data.Result) == "table" and not data.Preview then
 				notify("Crate (" .. tostring(data.Tier or "?") .. ")", tostring(data.Result.Name or "?"))
 			end
+			if kind == "Begin" and CrateSkip and type(data) == "table" and type(data.Token) == "string" and not data.Preview then
+				local signal = CrateRemotes:FindFirstChild("RevealSignal")
+				task.delay(0.5, function()
+					pcall(function()
+						signal:FireServer("Skipped", data.Token)
+						task.wait(0.3)
+						signal:FireServer("Dismissed", data.Token)
+					end)
+				end)
+			end
+		end)
+	end))
+end
+
+if OreDrops then
+	track(OreDrops.OnClientEvent:Connect(function(kind, a)
+		pcall(function()
+			if kind == "Created" and type(a) == "table" then
+				for _, d in pairs(a) do
+					addDrop(d)
+				end
+			elseif kind == "Snapshot" and type(a) == "table" then
+				Drops = {}
+				for _, d in pairs(a) do
+					addDrop(d)
+				end
+			elseif kind == "Collected" and type(a) == "table" then
+				for _, id in pairs(a) do
+					Drops[id] = nil
+				end
+			elseif kind == "CollectorTake" and type(a) == "table" and type(a.Ids) == "table" then
+				for _, id in pairs(a.Ids) do
+					Drops[id] = nil
+				end
+			elseif kind == "Cleared" then
+				Drops = {}
+			end
+			refreshDrops()
 		end)
 	end))
 end
@@ -393,4 +589,5 @@ end
 pcall(function()
 	MinerInventory.RequestInventory:FireServer()
 	OreInventory:FireServer("Request")
+	OreDrops:FireServer("Snapshot")
 end)
